@@ -1,0 +1,246 @@
+"""Provider adapters. Secrets are read only by this local process."""
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import subprocess
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+
+def _load_json(path: str) -> dict[str, Any]:
+    with open(os.path.expandvars(os.path.expanduser(path)), encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _http_json(url: str, headers: dict[str, str], timeout: int = 20) -> dict[str, Any]:
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def _post_form_json(url: str, form: dict[str, str], timeout: int = 20) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        data=urllib.parse.urlencode(form).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def _anthropic(entry: dict[str, Any]) -> dict[str, Any]:
+    path = entry.get("credential_file", "~/.claude/.credentials.json")
+    credentials = _load_json(path)["claudeAiOauth"]
+    payload = _http_json(
+        "https://api.anthropic.com/api/oauth/usage",
+        {
+            "Authorization": f"Bearer {credentials['accessToken']}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "token-limits-plasmoid/0.1",
+        },
+    )
+    def window(name: str):
+        value = payload.get(name)
+        return {"used_percent": value.get("utilization", 0), "reset_at": value.get("resets_at")} if value else None
+    return {
+        "available": not any((window(name) or {}).get("used_percent", 0) >= 100 for name in ("five_hour", "seven_day")),
+        "session": window("five_hour"),
+        "weekly": window("seven_day"),
+        "details": {"subscription": credentials.get("subscriptionType", "")},
+    }
+
+
+def _codex(entry: dict[str, Any]) -> dict[str, Any]:
+    auth = _load_json(entry.get("credential_file", "~/.codex/auth.json"))
+    tokens = auth["tokens"]
+    payload = _http_json(
+        entry.get("usage_url", "https://chatgpt.com/backend-api/wham/usage"),
+        {
+            "Authorization": f"Bearer {tokens['access_token']}",
+            "ChatGPT-Account-Id": tokens["account_id"],
+            "User-Agent": "token-limits-plasmoid/0.1",
+        },
+    )
+    rate = payload.get("rate_limit") or {}
+    result: dict[str, Any] = {
+        "available": bool(rate.get("allowed", not rate.get("limit_reached", False))),
+        "details": {"plan": payload.get("plan_type", "")},
+    }
+    for raw in (rate.get("primary_window"), rate.get("secondary_window")):
+        if not raw:
+            continue
+        target = "weekly" if int(raw.get("limit_window_seconds", 0)) >= 6 * 86400 else "session"
+        result[target] = {"used_percent": raw.get("used_percent", 0), "reset_at": raw.get("reset_at")}
+    return result
+
+
+def parse_grok_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    candidate = payload.get("config")
+    config: dict[str, Any] = candidate if isinstance(candidate, dict) else payload
+    percent = float(config.get("creditUsagePercent", 0))
+    period = config.get("currentPeriod") if isinstance(config.get("currentPeriod"), dict) else {}
+    reset_at = period.get("end") or config.get("billingPeriodEnd")
+    return {
+        "available": percent < 100,
+        "weekly": {"used_percent": percent, "reset_at": reset_at},
+    }
+
+
+def _save_json_private(path: str, payload: dict[str, Any]) -> None:
+    destination = Path(os.path.expanduser(path))
+    fd, temporary = tempfile.mkstemp(prefix=destination.name + ".", dir=destination.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _grok(entry: dict[str, Any]) -> dict[str, Any]:
+    path = entry.get("credential_file", "~/.grok/auth.json")
+    auth = _load_json(path)
+    account_key = entry.get("account_key")
+    if account_key:
+        record = auth[account_key]
+    else:
+        record = next((value for value in auth.values() if isinstance(value, dict) and value.get("key")), None)
+    if not record:
+        raise ValueError("no Grok OAuth account found")
+    assert isinstance(record, dict)
+    headers = {
+        "Authorization": f"Bearer {record['key']}",
+        "x-grok-client-version": entry.get("client_version", "0.2.111"),
+        "Accept": "application/json",
+        "User-Agent": "token-limits-plasmoid/0.1",
+    }
+    url = entry.get("usage_url", "https://cli-chat-proxy.grok.com/v1/billing?format=credits")
+    try:
+        return parse_grok_payload(_http_json(url, headers))
+    except urllib.error.HTTPError as error:
+        if error.code != 401 or not record.get("refresh_token"):
+            raise
+    refreshed = _post_form_json(
+        "https://auth.x.ai/oauth2/token",
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": record["refresh_token"],
+            "client_id": record.get("oidc_client_id", "b1a00492-073a-47ea-816f-4c329264a828"),
+        },
+    )
+    record["key"] = refreshed["access_token"]
+    if refreshed.get("refresh_token"):
+        record["refresh_token"] = refreshed["refresh_token"]
+    _save_json_private(path, auth)
+    headers["Authorization"] = f"Bearer {record['key']}"
+    return parse_grok_payload(_http_json(url, headers))
+
+
+def _epoch_seconds(value: Any) -> Any:
+    if isinstance(value, (int, float)) and value > 1_000_000_000_000:
+        return value / 1000
+    return value
+
+
+def _used_percent(row: dict[str, Any], prefix: str) -> float:
+    remaining = row.get(prefix + "_remaining_percent")
+    if remaining is not None:
+        return max(0.0, min(100.0, 100.0 - float(remaining)))
+    total = float(row.get(prefix + "_total_count") or 0)
+    used = float(row.get(prefix + "_usage_count") or 0)
+    return (used / total * 100.0) if total else 0.0
+
+
+def parse_minimax_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    candidate = payload.get("data")
+    data: dict[str, Any] = candidate if isinstance(candidate, dict) else payload
+    rows = data.get("model_remains") or data.get("modelRemains") or []
+    if not rows:
+        raise ValueError("MiniMax response contains no coding-plan interval")
+    row = next((item for item in rows if item.get("model_name") == "general"), rows[0])
+    session_percent = _used_percent(row, "current_interval")
+    result: dict[str, Any] = {
+        "available": session_percent < 100,
+        "session": {
+            "used_percent": session_percent,
+            "reset_at": _epoch_seconds(row.get("end_time") or row.get("endTime")),
+        },
+    }
+    if row.get("current_weekly_remaining_percent") is not None or row.get("current_weekly_total_count"):
+        weekly_percent = _used_percent(row, "current_weekly")
+        result["weekly"] = {
+            "used_percent": weekly_percent,
+            "reset_at": _epoch_seconds(row.get("weekly_end_time") or row.get("weeklyEndTime")),
+        }
+        result["available"] = result["available"] and weekly_percent < 100
+    return result
+
+
+def _minimax(entry: dict[str, Any]) -> dict[str, Any]:
+    token = ""
+    if entry.get("api_key_file"):
+        token = Path(os.path.expanduser(entry["api_key_file"])).read_text(encoding="utf-8").strip()
+    elif entry.get("api_key_env"):
+        token = os.environ.get(entry["api_key_env"], "")
+        if not token and entry.get("env_file"):
+            variable = entry["api_key_env"]
+            for line in Path(os.path.expanduser(entry["env_file"])).read_text(encoding="utf-8").splitlines():
+                candidate = line.strip()
+                if candidate.startswith("export "):
+                    candidate = candidate[7:].lstrip()
+                if candidate.startswith(variable + "="):
+                    token = candidate.split("=", 1)[1].strip().strip('"\'')
+                    break
+    if not token:
+        raise ValueError("MiniMax requires api_key_file or api_key_env")
+    base = entry.get("base_url", "https://api.minimax.io").rstrip("/")
+    payload = _http_json(
+        entry.get("usage_url", base + "/v1/api/openplatform/coding_plan/remains"),
+        {"Authorization": f"Bearer {token}", "User-Agent": "token-limits-plasmoid/0.1"},
+    )
+    return parse_minimax_payload(payload)
+
+
+def _command(entry: dict[str, Any]) -> dict[str, Any]:
+    command = entry.get("command")
+    if not command:
+        raise ValueError("command adapter requires 'command'")
+    argv = shlex.split(command) if isinstance(command, str) else list(command)
+    completed = subprocess.run(argv, check=True, capture_output=True, text=True, timeout=int(entry.get("timeout", 20)))
+    return json.loads(completed.stdout)
+
+
+def _json_url(entry: dict[str, Any]) -> dict[str, Any]:
+    headers = dict(entry.get("headers", {}))
+    token_file = entry.get("bearer_token_file")
+    if token_file:
+        headers["Authorization"] = "Bearer " + Path(os.path.expanduser(token_file)).read_text().strip()
+    return _http_json(entry["url"], headers, int(entry.get("timeout", 20)))
+
+
+def fetch_account(entry: dict[str, Any]) -> dict[str, Any]:
+    adapter = entry.get("adapter", entry.get("provider"))
+    if adapter == "fixture":
+        return dict(entry.get("fixture", {}))
+    if adapter == "anthropic":
+        return _anthropic(entry)
+    if adapter == "codex":
+        return _codex(entry)
+    if adapter == "grok":
+        return _grok(entry)
+    if adapter == "minimax":
+        return _minimax(entry)
+    if adapter == "command":
+        return _command(entry)
+    if adapter == "json_url":
+        return _json_url(entry)
+    raise ValueError(f"unknown adapter: {adapter}")

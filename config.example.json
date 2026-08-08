@@ -1,0 +1,53 @@
+{
+  "notifications": {
+    "enabled": true,
+    "session": 80,
+    "weekly": 80,
+    "sound": {
+      "enabled": true,
+      "file": "/usr/share/sounds/freedesktop/stereo/message.oga",
+      "volume": 70,
+      "events": ["threshold"]
+    }
+  },
+  "accounts": [
+    {
+      "provider": "anthropic",
+      "alias": "Privat",
+      "credential_file": "~/.claude-personal/.credentials.json",
+      "thresholds": {"session": 80, "weekly": 80}
+    },
+    {
+      "provider": "anthropic",
+      "alias": "Work",
+      "enabled": false,
+      "credential_file": "~/.claude-work/.credentials.json",
+      "thresholds": {"session": 80, "weekly": 80}
+    },
+    {
+      "provider": "codex",
+      "alias": "Privat",
+      "credential_file": "~/.codex/auth.json"
+    },
+    {
+      "provider": "codex",
+      "alias": "Work",
+      "enabled": false,
+      "credential_file": "~/.codex-work/auth.json"
+    },
+    {
+      "provider": "grok",
+      "alias": "Privat",
+      "enabled": false,
+      "credential_file": "~/.grok/auth.json"
+    },
+    {
+      "provider": "minimax",
+      "alias": "Work",
+      "enabled": false,
+      "api_key_env": "MINIMAX_API_KEY",
+      "env_file": "~/.hermes/profiles/personal/.env",
+      "base_url": "https://api.minimax.io"
+    }
+  ]
+}

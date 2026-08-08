@@ -1,0 +1,17 @@
+{
+  "KPackageStructure": "Plasma/Applet",
+  "KPlugin": {
+    "Authors": [{"Name": "Max & Hermes Agent"}],
+    "Category": "System Information",
+    "Description": "Session- und Wochenlimits mehrerer KI-Anbieter und Konten",
+    "EnabledByDefault": true,
+    "FormFactors": ["desktop", "horizontal", "vertical"],
+    "Icon": "view-statistics",
+    "Id": "de.max.tokenlimits",
+    "License": "MIT",
+    "Name": "Token Limits",
+    "Version": "0.1.0",
+    "Website": "https://github.com/"
+  },
+  "X-Plasma-API-Minimum-Version": "6.0"
+}
