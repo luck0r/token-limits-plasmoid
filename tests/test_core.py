@@ -28,7 +28,7 @@ class AccountNormalizationTests(unittest.TestCase):
     def test_keeps_session_and_weekly_windows_separate(self):
         account = normalize_account(
             provider="anthropic",
-            alias="Privat",
+            alias="Personal",
             raw={
                 "available": True,
                 "session": {"used_percent": 42.5, "reset_at": "2026-08-08T15:00:00Z"},
@@ -36,7 +36,7 @@ class AccountNormalizationTests(unittest.TestCase):
             },
             now=NOW,
         )
-        self.assertEqual(account["id"], "anthropic:Privat")
+        self.assertEqual(account["id"], "anthropic:Personal")
         self.assertEqual(account["windows"]["session"]["used_percent"], 42.5)
         self.assertEqual(account["windows"]["weekly"]["used_percent"], 81.0)
         self.assertEqual(account["windows"]["session"]["reset_in_seconds"], 10800)
@@ -53,7 +53,7 @@ class NotificationTests(unittest.TestCase):
     def test_threshold_fires_once_per_reset_cycle(self):
         account = normalize_account(
             "anthropic",
-            "Privat",
+            "Personal",
             {"available": True, "weekly": {"used_percent": 82, "reset_at": 1786536000}},
             now=NOW,
         )
@@ -71,11 +71,11 @@ class NotificationTests(unittest.TestCase):
 
     def test_recovery_fires_after_account_becomes_available(self):
         unavailable = normalize_account(
-            "codex", "Privat", {"available": False, "session": {"used_percent": 100}}, now=NOW
+            "codex", "Personal", {"available": False, "session": {"used_percent": 100}}, now=NOW
         )
         _, state = evaluate_notifications(unavailable, {}, {"session": 80})
         available = normalize_account(
-            "codex", "Privat", {"available": True, "session": {"used_percent": 2}}, now=NOW
+            "codex", "Personal", {"available": True, "session": {"used_percent": 2}}, now=NOW
         )
         events, _ = evaluate_notifications(available, state, {"session": 80})
         self.assertIn("available_again", [e["kind"] for e in events])
@@ -85,12 +85,12 @@ class MultiAccountTests(unittest.TestCase):
     def test_same_provider_accounts_stay_distinct(self):
         config = {
             "accounts": [
-                {"provider": "anthropic", "alias": "Privat", "adapter": "fixture", "fixture": {"weekly": {"used_percent": 20}}},
+                {"provider": "anthropic", "alias": "Personal", "adapter": "fixture", "fixture": {"weekly": {"used_percent": 20}}},
                 {"provider": "anthropic", "alias": "Work", "adapter": "fixture", "fixture": {"weekly": {"used_percent": 70}}},
             ]
         }
         result, _events, _state = process_accounts(config, {}, now=NOW)
-        self.assertEqual([a["id"] for a in result["accounts"]], ["anthropic:Privat", "anthropic:Work"])
+        self.assertEqual([a["id"] for a in result["accounts"]], ["anthropic:Personal", "anthropic:Work"])
         self.assertEqual(result["accounts"][1]["windows"]["weekly"]["used_percent"], 70.0)
 
     def test_duplicate_provider_alias_is_rejected(self):
@@ -103,11 +103,11 @@ class MultiAccountTests(unittest.TestCase):
 
     def test_disabled_accounts_are_skipped(self):
         config = {"accounts": [
-            {"provider": "anthropic", "alias": "Privat", "adapter": "fixture", "fixture": {}},
+            {"provider": "anthropic", "alias": "Personal", "adapter": "fixture", "fixture": {}},
             {"provider": "anthropic", "alias": "Work", "enabled": False, "adapter": "fixture", "fixture": {}},
         ]}
         result, _events, _state = process_accounts(config, {}, now=NOW)
-        self.assertEqual([a["id"] for a in result["accounts"]], ["anthropic:Privat"])
+        self.assertEqual([a["id"] for a in result["accounts"]], ["anthropic:Personal"])
 
 
 if __name__ == "__main__":

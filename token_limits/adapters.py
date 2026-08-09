@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -160,22 +161,67 @@ def _used_percent(row: dict[str, Any], prefix: str) -> float:
     return (used / total * 100.0) if total else 0.0
 
 
-def parse_minimax_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def parse_minimax_payload(payload: dict[str, Any], product_name: str | None = None) -> dict[str, Any]:
     candidate = payload.get("data")
     data: dict[str, Any] = candidate if isinstance(candidate, dict) else payload
-    rows = data.get("model_remains") or data.get("modelRemains") or []
+    raw_rows = data.get("model_remains") or data.get("modelRemains") or []
+    rows = [item for item in raw_rows if isinstance(item, dict)] if isinstance(raw_rows, list) else []
     if not rows:
         raise ValueError("MiniMax response contains no coding-plan interval")
-    row = next((item for item in rows if item.get("model_name") == "general"), rows[0])
-    session_percent = _used_percent(row, "current_interval")
-    result: dict[str, Any] = {
-        "available": session_percent < 100,
-        "session": {
+    def normalized_name(item: dict[str, Any]) -> str:
+        return str(item.get("model_name") or item.get("modelName") or "").casefold()
+
+    non_coding_products = {"video", "image", "music", "audio", "voice", "speech"}
+
+    def is_non_coding_product(item: dict[str, Any]) -> bool:
+        tokens = set(filter(None, re.split(r"[-_.\s]+", normalized_name(item))))
+        return bool(tokens & non_coding_products)
+
+    def is_coding_product(item: dict[str, Any]) -> bool:
+        name = normalized_name(item)
+        if is_non_coding_product(item):
+            return False
+        return (
+            re.fullmatch(r"coding(?:[-_.][a-z0-9]+)*", name) is not None
+            or re.fullmatch(r"minimax[-_.]m\d+(?:[-_.][a-z0-9]+)*", name) is not None
+        )
+
+    preferred_name = str(product_name or "").casefold()
+    products = [item.get("model_name") or item.get("modelName") for item in rows]
+    if preferred_name:
+        row = next((item for item in rows if normalized_name(item) == preferred_name), None)
+        if row is None:
+            raise ValueError(f"MiniMax response has no product {product_name!r} (products: {products})")
+    else:
+        row = next((item for item in rows if normalized_name(item) == "general"), None)
+        if row is None and len(rows) == 1:
+            row = None if is_non_coding_product(rows[0]) else rows[0]
+        if row is None and len(rows) > 1:
+            coding_rows = [item for item in rows if is_coding_product(item)]
+            if len(coding_rows) == 1:
+                row = coding_rows[0]
+    if row is None:
+        raise ValueError(f"MiniMax response contains no identifiable coding-plan quota (products: {products})")
+    def has_window(prefix: str) -> bool:
+        return (
+            row.get(f"{prefix}_remaining_percent") is not None
+            or bool(row.get(f"{prefix}_total_count"))
+        )
+
+    has_session = has_window("current_interval")
+    has_weekly = has_window("current_weekly")
+    if not has_session and not has_weekly:
+        raise ValueError("MiniMax coding-plan quota has no recognized quota windows")
+
+    result: dict[str, Any] = {"available": True}
+    if has_session:
+        session_percent = _used_percent(row, "current_interval")
+        result["session"] = {
             "used_percent": session_percent,
             "reset_at": _epoch_seconds(row.get("end_time") or row.get("endTime")),
-        },
-    }
-    if row.get("current_weekly_remaining_percent") is not None or row.get("current_weekly_total_count"):
+        }
+        result["available"] = session_percent < 100
+    if has_weekly:
         weekly_percent = _used_percent(row, "current_weekly")
         result["weekly"] = {
             "used_percent": weekly_percent,
@@ -207,7 +253,7 @@ def _minimax(entry: dict[str, Any]) -> dict[str, Any]:
         entry.get("usage_url", base + "/v1/api/openplatform/coding_plan/remains"),
         {"Authorization": f"Bearer {token}", "User-Agent": "token-limits-plasmoid/0.1"},
     )
-    return parse_minimax_payload(payload)
+    return parse_minimax_payload(payload, entry.get("product_name"))
 
 
 def _command(entry: dict[str, Any]) -> dict[str, Any]:
