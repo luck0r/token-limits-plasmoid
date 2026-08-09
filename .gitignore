@@ -1,3 +1,19 @@
 __pycache__/
 *.py[cod]
 dist/
+
+# Local credentials and environment files
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.token
+auth.json
+.credentials.json
+
+# Runtime/user configuration and generated state
+config.json
+status.json
+state.json
+*.log
