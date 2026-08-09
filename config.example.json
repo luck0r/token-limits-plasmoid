@@ -13,7 +13,7 @@
   "accounts": [
     {
       "provider": "anthropic",
-      "alias": "Privat",
+      "alias": "Personal",
       "credential_file": "~/.claude-personal/.credentials.json",
       "thresholds": {"session": 80, "weekly": 80}
     },
@@ -26,7 +26,7 @@
     },
     {
       "provider": "codex",
-      "alias": "Privat",
+      "alias": "Personal",
       "credential_file": "~/.codex/auth.json"
     },
     {
@@ -37,7 +37,7 @@
     },
     {
       "provider": "grok",
-      "alias": "Privat",
+      "alias": "Personal",
       "enabled": false,
       "credential_file": "~/.grok/auth.json"
     },

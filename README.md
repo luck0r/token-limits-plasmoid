@@ -2,6 +2,8 @@
 
 A KDE Plasma widget for Kubuntu/Ubuntu 26.04 LTS (tested with Plasma 6.6) that displays session and weekly usage limits for multiple AI subscriptions.
 
+The documentation and configuration examples are in English. The widget UI and desktop notifications are currently German-only.
+
 ![Token Limits Plasma widget](docs/widget.png)
 
 ## Features
@@ -105,8 +107,8 @@ Store the MiniMax API key in a file with mode `600`, then reference it with `api
 ```bash
 mkdir -p ~/.config/token-limits
 chmod 700 ~/.config/token-limits
+install -m 600 /dev/null ~/.config/token-limits/minimax-api-key
 printf '%s' "$MINIMAX_API_KEY" > ~/.config/token-limits/minimax-api-key
-chmod 600 ~/.config/token-limits/minimax-api-key
 ```
 
 ```json
@@ -118,7 +120,7 @@ chmod 600 ~/.config/token-limits/minimax-api-key
 }
 ```
 
-MiniMax reports both the current coding-plan interval and a weekly window when they are available. The collector uses the `general` product row and ignores unrelated products such as video quotas.
+MiniMax reports both the current coding-plan interval and a weekly window when they are available. The collector prefers identifiable coding products such as `general`, accepts a single unlabeled row for compatibility, and reports ambiguous multi-product responses as errors instead of displaying unrelated quotas. Set `product_name` to select an exact provider product label if MiniMax changes its naming.
 
 ## Custom adapters
 
