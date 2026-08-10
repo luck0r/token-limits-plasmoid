@@ -1,6 +1,7 @@
 """Core normalization and notification policy for Token Limits."""
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -79,6 +80,19 @@ def evaluate_notifications(account: dict[str, Any], previous: dict[str, Any], th
 
 
 def process_accounts(config: dict[str, Any], previous_state: dict[str, Any], now: datetime | None = None):
+    from .adapters import provider_retry_budget
+
+    try:
+        budget_seconds = float(config.get("retry_budget_seconds", 90))
+        if not math.isfinite(budget_seconds) or budget_seconds < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        budget_seconds = 90.0
+    with provider_retry_budget(budget_seconds):
+        return _process_accounts(config, previous_state, now)
+
+
+def _process_accounts(config: dict[str, Any], previous_state: dict[str, Any], now: datetime | None = None):
     from .adapters import fetch_account
 
     now = now or datetime.now(timezone.utc)
@@ -97,17 +111,31 @@ def process_accounts(config: dict[str, Any], previous_state: dict[str, Any], now
         if account_id in seen:
             raise ValueError(f"duplicate account id: {account_id}")
         seen.add(account_id)
+        previous_account = previous_state.get("accounts", {}).get(account_id, {})
+        fetch_failed = False
         try:
             raw = fetch_account(entry)
         except Exception as exc:  # Collector must keep other accounts alive.
-            raw = {"available": False, "error": str(exc)}
+            fetch_failed = True
+            error_message = str(exc)
+            if exc.__cause__ is not None:
+                error_message = f"{error_message} (caused by {exc.__cause__})"
+            raw = {
+                "available": False,
+                "error": error_message,
+            }
         account = normalize_account(provider, alias, raw, now)
         result_accounts.append(account)
         thresholds = dict(defaults)
         thresholds.update(entry.get("thresholds", {}))
-        account_events, account_state = evaluate_notifications(
-            account, previous_state.get("accounts", {}).get(account_id, {}), thresholds
-        )
+        if fetch_failed:
+            account_events = []
+            account_state = dict(previous_account)
+            account_state["notified"] = dict(previous_account.get("notified", {}))
+        else:
+            account_events, account_state = evaluate_notifications(
+                account, previous_account, thresholds
+            )
         events.extend(account_events)
         next_state["accounts"][account_id] = account_state
 

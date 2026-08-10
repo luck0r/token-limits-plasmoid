@@ -187,7 +187,16 @@ Quota requests automatically retry HTTP 429 responses up to two times. Short
 that header use bounded exponential backoff with jitter. To avoid blocking the
 collector or violating a server-requested cooldown, `Retry-After` delays longer
 than 10 seconds are not shortened or waited out—the next five-minute timer run
-tries again instead.
+tries again instead. All providers share a 90-second retry budget. Retry delays
+and the measured runtime of retry requests consume it; normal first attempts and
+unrelated request latency do not. Configure the top-level `retry_budget_seconds`
+with a non-negative number (`0` disables retries); missing, negative, or invalid
+values use 90 seconds. Retry requests keep their configured timeout when it fits;
+otherwise it is capped to the remaining budget. A retry is skipped if less than
+five seconds remain after its delay. If a capped retry times out, the original
+HTTP 429 error is preserved. Fetch errors are shown as unavailable, but do not
+overwrite the last successful notification state,
+preventing false "available again" alerts.
 
 Generated files:
 
