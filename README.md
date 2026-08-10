@@ -182,6 +182,13 @@ journalctl --user -u token-limits.service --since today
 token-limits-collector --no-notify
 ```
 
+Quota requests automatically retry HTTP 429 responses up to two times. Short
+`Retry-After` values (seconds or HTTP dates) are respected; responses without
+that header use bounded exponential backoff with jitter. To avoid blocking the
+collector or violating a server-requested cooldown, `Retry-After` delays longer
+than 10 seconds are not shortened or waited out—the next five-minute timer run
+tries again instead.
+
 Generated files:
 
 ```text

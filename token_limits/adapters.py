@@ -2,14 +2,19 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import random
 import re
 import shlex
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -19,10 +24,63 @@ def _load_json(path: str) -> dict[str, Any]:
         return json.load(handle)
 
 
-def _http_json(url: str, headers: dict[str, str], timeout: int = 20) -> dict[str, Any]:
+def _open_json(
+    request: urllib.request.Request,
+    timeout: int = 20,
+    max_retries: int = 2,
+    retry_base_delay: float = 1.0,
+    retry_max_delay: float = 10.0,
+) -> dict[str, Any]:
+    for attempt in range(max_retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as error:
+            if error.code != 429 or attempt >= max_retries:
+                raise
+            retry_after = error.headers.get("Retry-After") if error.headers else None
+            if retry_after is None:
+                delay = None
+            else:
+                try:
+                    delay = float(retry_after)
+                except ValueError:
+                    try:
+                        parsed = parsedate_to_datetime(retry_after)
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        delay = parsed.timestamp() - time.time()
+                    except (TypeError, ValueError, OverflowError):
+                        delay = None
+            if delay is None:
+                delay = min(
+                    retry_max_delay,
+                    retry_base_delay * (2 ** attempt) + random.uniform(0, retry_base_delay),
+                )
+            else:
+                if not math.isfinite(delay) or delay > retry_max_delay:
+                    raise
+                delay = max(retry_base_delay, delay)
+            time.sleep(delay)
+    raise RuntimeError("HTTP retry loop exhausted")
+
+
+def _http_json(
+    url: str,
+    headers: dict[str, str],
+    timeout: int = 20,
+    max_retries: int = 2,
+    retry_base_delay: float = 1.0,
+    retry_max_delay: float = 10.0,
+) -> dict[str, Any]:
     request = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.load(response)
+    return _open_json(
+        request,
+        timeout=timeout,
+        max_retries=max_retries,
+        retry_base_delay=retry_base_delay,
+        retry_max_delay=retry_max_delay,
+    )
 
 
 def _post_form_json(url: str, form: dict[str, str], timeout: int = 20) -> dict[str, Any]:
@@ -31,8 +89,7 @@ def _post_form_json(url: str, form: dict[str, str], timeout: int = 20) -> dict[s
         data=urllib.parse.urlencode(form).encode(),
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.load(response)
+    return _open_json(request, timeout)
 
 
 def _anthropic(entry: dict[str, Any]) -> dict[str, Any]:

@@ -1,9 +1,158 @@
+import io
 import tempfile
 import unittest
+import urllib.error
+from email.message import Message
+from email.utils import formatdate
 from pathlib import Path
 from unittest.mock import patch
 
-from token_limits.adapters import _minimax, parse_grok_payload, parse_minimax_payload
+from token_limits.adapters import _http_json, _minimax, _post_form_json, parse_grok_payload, parse_minimax_payload
+
+
+class HttpRetryTests(unittest.TestCase):
+    def test_retries_rate_limited_oauth_form_post(self):
+        headers = Message()
+        headers["Retry-After"] = "1"
+        error = urllib.error.HTTPError(
+            "https://example.test/token", 429, "Too Many Requests",
+            headers, None,
+        )
+        response = io.BytesIO(b'{"access_token": "dummy"}')
+        with patch("token_limits.adapters.urllib.request.urlopen", side_effect=[error, response]) as request, \
+                patch("time.sleep") as sleep:
+            result = _post_form_json("https://example.test/token", {"grant_type": "refresh_token"})
+
+        self.assertEqual(result, {"access_token": "dummy"})
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(1.0)
+
+    def test_retries_429_after_short_retry_after_delay(self):
+        headers = Message()
+        headers["Retry-After"] = "2"
+        error = urllib.error.HTTPError(
+            "https://example.test/usage", 429, "Too Many Requests",
+            headers, None,
+        )
+        response = io.BytesIO(b'{"ok": true}')
+        with patch("token_limits.adapters.urllib.request.urlopen", side_effect=[error, response]) as request, \
+                patch("time.sleep") as sleep:
+            result = _http_json("https://example.test/usage", {})
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(2.0)
+
+    def test_does_not_shorten_long_retry_after_or_block_collector(self):
+        headers = Message()
+        headers["Retry-After"] = "120"
+        error = urllib.error.HTTPError(
+            "https://example.test/usage", 429, "Too Many Requests",
+            headers, None,
+        )
+        with patch("token_limits.adapters.urllib.request.urlopen", side_effect=error) as request, \
+                patch("time.sleep") as sleep:
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                _http_json("https://example.test/usage", {})
+
+        self.assertIs(raised.exception, error)
+        self.assertEqual(request.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_uses_exponential_backoff_with_jitter_without_retry_after(self):
+        errors = [
+            urllib.error.HTTPError(
+                "https://example.test/usage", 429, "Too Many Requests",
+                Message(), None,
+            )
+            for _ in range(2)
+        ]
+        response = io.BytesIO(b'{"ok": true}')
+        with patch("token_limits.adapters.urllib.request.urlopen", side_effect=[*errors, response]), \
+                patch("random.uniform", return_value=0.25), \
+                patch("time.sleep") as sleep:
+            result = _http_json("https://example.test/usage", {})
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1.25, 2.25])
+
+    def test_supports_http_date_retry_after(self):
+        headers = Message()
+        headers["Retry-After"] = formatdate(1002, usegmt=True)
+        error = urllib.error.HTTPError(
+            "https://example.test/usage", 429, "Too Many Requests",
+            headers, None,
+        )
+        response = io.BytesIO(b'{"ok": true}')
+        with patch("token_limits.adapters.urllib.request.urlopen", side_effect=[error, response]), \
+                patch("time.time", return_value=1000), \
+                patch("random.uniform", return_value=0), \
+                patch("time.sleep") as sleep:
+            result = _http_json("https://example.test/usage", {})
+
+        self.assertEqual(result, {"ok": True})
+        sleep.assert_called_once_with(2.0)
+
+    def test_missing_http_error_headers_uses_backoff(self):
+        error = urllib.error.HTTPError(
+            "https://example.test/usage", 429, "Too Many Requests",
+            None, None,  # type: ignore[arg-type]
+        )
+        response = io.BytesIO(b'{"ok": true}')
+        with patch("token_limits.adapters.urllib.request.urlopen", side_effect=[error, response]), \
+                patch("random.uniform", return_value=0), \
+                patch("time.sleep") as sleep:
+            result = _http_json("https://example.test/usage", {})
+
+        self.assertEqual(result, {"ok": True})
+        sleep.assert_called_once_with(1.0)
+
+    def test_zero_retry_after_is_floored_to_base_delay(self):
+        headers = Message()
+        headers["Retry-After"] = "0"
+        error = urllib.error.HTTPError(
+            "https://example.test/usage", 429, "Too Many Requests",
+            headers, None,
+        )
+        response = io.BytesIO(b'{"ok": true}')
+        with patch("token_limits.adapters.urllib.request.urlopen", side_effect=[error, response]), \
+                patch("time.sleep") as sleep:
+            result = _http_json("https://example.test/usage", {})
+
+        self.assertEqual(result, {"ok": True})
+        sleep.assert_called_once_with(1.0)
+
+    def test_non_429_error_is_not_retried(self):
+        error = urllib.error.HTTPError(
+            "https://example.test/usage", 401, "Unauthorized",
+            Message(), None,
+        )
+        with patch("token_limits.adapters.urllib.request.urlopen", side_effect=error) as request, \
+                patch("time.sleep") as sleep:
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                _http_json("https://example.test/usage", {})
+
+        self.assertIs(raised.exception, error)
+        self.assertEqual(request.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_stops_after_max_retries_and_raises_last_429(self):
+        errors = [
+            urllib.error.HTTPError(
+                "https://example.test/usage", 429, "Too Many Requests",
+                Message(), None,
+            )
+            for _ in range(3)
+        ]
+        with patch("token_limits.adapters.urllib.request.urlopen", side_effect=errors) as request, \
+                patch("random.uniform", return_value=0), \
+                patch("time.sleep") as sleep:
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                _http_json("https://example.test/usage", {})
+
+        self.assertIs(raised.exception, errors[-1])
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1.0, 2.0])
 
 
 class GrokAdapterTests(unittest.TestCase):
