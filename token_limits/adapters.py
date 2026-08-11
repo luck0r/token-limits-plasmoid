@@ -2,16 +2,38 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import random
 import re
 import shlex
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
+from contextvars import ContextVar
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
+
+
+_RETRY_BUDGET_REMAINING: ContextVar[float | None] = ContextVar(
+    "provider_retry_budget_remaining", default=None
+)
+_MIN_RETRY_TIMEOUT = 5.0
+
+
+@contextmanager
+def provider_retry_budget(seconds: float):
+    token = _RETRY_BUDGET_REMAINING.set(max(0.0, seconds))
+    try:
+        yield
+    finally:
+        _RETRY_BUDGET_REMAINING.reset(token)
 
 
 def _load_json(path: str) -> dict[str, Any]:
@@ -19,10 +41,100 @@ def _load_json(path: str) -> dict[str, Any]:
         return json.load(handle)
 
 
-def _http_json(url: str, headers: dict[str, str], timeout: int = 20) -> dict[str, Any]:
+def _open_json(
+    request: urllib.request.Request,
+    timeout: int = 20,
+    max_retries: int = 2,
+    retry_base_delay: float = 1.0,
+    retry_max_delay: float = 10.0,
+) -> dict[str, Any]:
+    attempt = 0
+    last_rate_limit_error: urllib.error.HTTPError | None = None
+    while True:
+        configured_timeout = float(timeout)
+        attempt_timeout = configured_timeout
+        if attempt > 0:
+            remaining_budget = _RETRY_BUDGET_REMAINING.get()
+            if remaining_budget is not None:
+                attempt_timeout = min(attempt_timeout, remaining_budget)
+        retry_timeout_capped = attempt_timeout < configured_timeout
+        try:
+            track_retry_time = attempt > 0 and _RETRY_BUDGET_REMAINING.get() is not None
+            started_at = time.monotonic() if track_retry_time else None
+            try:
+                with urllib.request.urlopen(request, timeout=attempt_timeout) as response:
+                    return json.load(response)
+            finally:
+                if started_at is not None:
+                    elapsed = max(0.0, time.monotonic() - started_at)
+                    remaining = _RETRY_BUDGET_REMAINING.get()
+                    if remaining is not None:
+                        _RETRY_BUDGET_REMAINING.set(max(0.0, remaining - elapsed))
+        except urllib.error.HTTPError as error:
+            if error.code != 429 or attempt >= max_retries:
+                raise
+            last_rate_limit_error = error
+            retry_after = error.headers.get("Retry-After") if error.headers else None
+            if retry_after is None:
+                delay = None
+            else:
+                try:
+                    delay = float(retry_after)
+                except ValueError:
+                    try:
+                        parsed = parsedate_to_datetime(retry_after)
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        delay = parsed.timestamp() - time.time()
+                    except (TypeError, ValueError, OverflowError):
+                        delay = None
+            if delay is None:
+                delay = min(
+                    retry_max_delay,
+                    retry_base_delay * (2 ** attempt) + random.uniform(0, retry_base_delay),
+                )
+            else:
+                if not math.isfinite(delay) or delay > retry_max_delay:
+                    raise
+                delay = max(retry_base_delay, delay)
+            remaining_budget = _RETRY_BUDGET_REMAINING.get()
+            if remaining_budget is not None:
+                request_budget = remaining_budget - delay
+                if request_budget < _MIN_RETRY_TIMEOUT:
+                    raise
+                _RETRY_BUDGET_REMAINING.set(request_budget)
+            time.sleep(delay)
+            attempt += 1
+        except (urllib.error.URLError, TimeoutError) as error:
+            is_timeout = isinstance(error, TimeoutError) or isinstance(
+                getattr(error, "reason", None), TimeoutError
+            )
+            if (
+                attempt > 0
+                and last_rate_limit_error is not None
+                and is_timeout
+                and retry_timeout_capped
+            ):
+                raise last_rate_limit_error from error
+            raise
+
+
+def _http_json(
+    url: str,
+    headers: dict[str, str],
+    timeout: int = 20,
+    max_retries: int = 2,
+    retry_base_delay: float = 1.0,
+    retry_max_delay: float = 10.0,
+) -> dict[str, Any]:
     request = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.load(response)
+    return _open_json(
+        request,
+        timeout=timeout,
+        max_retries=max_retries,
+        retry_base_delay=retry_base_delay,
+        retry_max_delay=retry_max_delay,
+    )
 
 
 def _post_form_json(url: str, form: dict[str, str], timeout: int = 20) -> dict[str, Any]:
@@ -31,8 +143,7 @@ def _post_form_json(url: str, form: dict[str, str], timeout: int = 20) -> dict[s
         data=urllib.parse.urlencode(form).encode(),
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.load(response)
+    return _open_json(request, timeout=timeout)
 
 
 def _anthropic(entry: dict[str, Any]) -> dict[str, Any]:
