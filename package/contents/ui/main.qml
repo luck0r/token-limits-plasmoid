@@ -18,7 +18,11 @@ PlasmoidItem {
 
     Plasmoid.title: i18n("Token Limits")
     toolTipMainText: i18n("Token Limits")
-    toolTipSubText: accounts.length ? i18n("%1 Konten · Maximum %2%", accounts.length, Math.round(maximumPercent())) : (loadError || i18n("Noch keine Daten"))
+    toolTipSubText: root.hasFetchIssue() && !root.hasUsableWindows()
+        ? (root.loadError || i18n("Abruf fehlgeschlagen"))
+        : (accounts.length
+            ? i18n("%1 Konten · Maximum %2%", accounts.length, Math.round(maximumPercent()))
+            : (loadError || i18n("Noch keine Daten")))
 
     function applyStatus(text) {
         try {
@@ -71,6 +75,38 @@ PlasmoidItem {
         return Kirigami.Theme.positiveTextColor
     }
 
+    function hasFetchIssue() {
+        if (root.loadError !== "") return true
+        return accounts.some(function(account) {
+            return account.availability_state === "error"
+                || account.availability_state === "rate_limited"
+        })
+    }
+
+    function hasUsableWindows() {
+        return accounts.some(function(account) {
+            return account.windows && Object.keys(account.windows).length > 0
+        })
+    }
+
+    function availabilityText(account) {
+        if (account.availability_state === "error") return i18n("Fehler")
+        if (account.availability_state === "rate_limited") return i18n("gedrosselt")
+        return account.available ? i18n("verfügbar") : i18n("limitiert")
+    }
+
+    function availabilityIcon(account) {
+        if (account.availability_state === "error"
+                || account.availability_state === "rate_limited") return "dialog-warning"
+        return account.available ? "emblem-success" : "emblem-error"
+    }
+
+    function availabilityColor(account) {
+        if (account.availability_state === "error"
+                || account.availability_state === "rate_limited") return Kirigami.Theme.neutralTextColor
+        return account.available ? Kirigami.Theme.positiveTextColor : Kirigami.Theme.negativeTextColor
+    }
+
     Plasma5Support.DataSource {
         id: statusSource
         engine: "executable"
@@ -101,13 +137,17 @@ PlasmoidItem {
             anchors.centerIn: parent
             spacing: Kirigami.Units.smallSpacing
             Kirigami.Icon {
-                source: "view-statistics"
+                source: root.hasFetchIssue() ? "dialog-warning" : "view-statistics"
                 implicitWidth: Kirigami.Units.iconSizes.smallMedium
                 implicitHeight: implicitWidth
-                color: root.quotaColor(root.maximumPercent(Plasmoid.configuration.compactMetric))
+                color: root.hasUsableWindows()
+                    ? root.quotaColor(root.maximumPercent(Plasmoid.configuration.compactMetric))
+                    : Kirigami.Theme.neutralTextColor
             }
             Controls.Label {
-                text: Math.round(root.maximumPercent(Plasmoid.configuration.compactMetric)) + "%"
+                text: root.hasFetchIssue() && !root.hasUsableWindows()
+                    ? "!"
+                    : Math.round(root.maximumPercent(Plasmoid.configuration.compactMetric)) + "%"
                 font.bold: true
             }
         }
@@ -151,7 +191,7 @@ PlasmoidItem {
                         RowLayout {
                             Layout.fillWidth: true
                             Kirigami.Icon {
-                                source: modelData.available ? "emblem-success" : "emblem-error"
+                                source: root.availabilityIcon(modelData)
                                 implicitWidth: Kirigami.Units.iconSizes.smallMedium
                                 implicitHeight: implicitWidth
                             }
@@ -161,8 +201,8 @@ PlasmoidItem {
                                 Layout.fillWidth: true
                             }
                             Controls.Label {
-                                text: modelData.available ? i18n("verfügbar") : i18n("limitiert")
-                                color: modelData.available ? Kirigami.Theme.positiveTextColor : Kirigami.Theme.negativeTextColor
+                                text: root.availabilityText(modelData)
+                                color: root.availabilityColor(modelData)
                             }
                         }
                         Controls.Label {

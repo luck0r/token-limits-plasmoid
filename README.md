@@ -131,10 +131,16 @@ A command adapter must print one canonical JSON object to standard output:
 ```json
 {
   "available": true,
+  "availability_state": "available",
   "session": {"used_percent": 52, "reset_at": "2026-08-08T18:00:00Z"},
   "weekly": {"used_percent": 71, "reset_at": 1786536000}
 }
 ```
+
+`availability_state` is optional. Normal quota payloads derive `available` or
+`limited` from `available` and the window percentages. Adapters may explicitly
+report only `error` or `rate_limited`; either state forces `available` to false.
+Contradictory or unknown values are ignored.
 
 Example configuration:
 

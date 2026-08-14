@@ -45,6 +45,7 @@ class AccountNormalizationTests(unittest.TestCase):
         self.assertEqual(account["windows"]["session"]["used_percent"], 42.5)
         self.assertEqual(account["windows"]["weekly"]["used_percent"], 81.0)
         self.assertEqual(account["windows"]["session"]["reset_in_seconds"], 10800)
+        self.assertEqual(account["availability_state"], "available")
 
     def test_clamps_percent_and_derives_availability(self):
         account = normalize_account(
@@ -52,6 +53,60 @@ class AccountNormalizationTests(unittest.TestCase):
         )
         self.assertEqual(account["windows"]["session"]["used_percent"], 100.0)
         self.assertFalse(account["available"])
+        self.assertEqual(account["availability_state"], "limited")
+
+    def test_rejects_contradictory_adapter_availability_state(self):
+        account = normalize_account(
+            "command",
+            "Local",
+            {"available": False, "availability_state": "available"},
+            now=NOW,
+        )
+
+        self.assertFalse(account["available"])
+        self.assertEqual(account["availability_state"], "limited")
+
+    def test_rejects_unknown_adapter_availability_state(self):
+        account = normalize_account(
+            "command",
+            "Local",
+            {"available": True, "availability_state": "everything-is-fine"},
+            now=NOW,
+        )
+
+        self.assertEqual(account["availability_state"], "available")
+
+    def test_adapter_error_state_forces_unavailable(self):
+        account = normalize_account(
+            "command",
+            "Local",
+            {"available": True, "availability_state": "error"},
+            now=NOW,
+        )
+
+        self.assertFalse(account["available"])
+        self.assertEqual(account["availability_state"], "error")
+
+    def test_adapter_rate_limited_state_forces_unavailable(self):
+        account = normalize_account(
+            "command",
+            "Local",
+            {"available": True, "availability_state": "rate_limited"},
+            now=NOW,
+        )
+
+        self.assertFalse(account["available"])
+        self.assertEqual(account["availability_state"], "rate_limited")
+
+    def test_non_string_adapter_state_falls_back_to_derived_state(self):
+        account = normalize_account(
+            "json_url",
+            "Local",
+            {"available": True, "availability_state": {"unexpected": True}},
+            now=NOW,
+        )
+
+        self.assertEqual(account["availability_state"], "available")
 
 
 class NotificationTests(unittest.TestCase):
@@ -292,6 +347,57 @@ class MultiAccountTests(unittest.TestCase):
 
         self.assertIn("threshold", [event["kind"] for event in events])
 
+    def test_adapter_error_state_preserves_notification_state(self):
+        config = {"accounts": [{"provider": "command", "alias": "Local"}]}
+        previous = {"accounts": {
+            "command:Local": {"available": True, "notified": {}},
+        }}
+        payload = {
+            "available": True,
+            "availability_state": "error",
+            "error": "upstream unavailable",
+        }
+
+        with patch("token_limits.adapters.fetch_account", return_value=payload):
+            _result, events, state = process_accounts(config, previous, now=NOW)
+
+        self.assertEqual(events, [])
+        self.assertEqual(state["accounts"]["command:Local"], previous["accounts"]["command:Local"])
+
+        with patch("token_limits.adapters.fetch_account", return_value={"available": True}):
+            _result, recovered_events, _state = process_accounts(config, state, now=NOW)
+        self.assertNotIn("available_again", [event["kind"] for event in recovered_events])
+
+    def test_degraded_payload_with_windows_evaluates_threshold_without_resetting_availability(self):
+        config = {"accounts": [{"provider": "command", "alias": "Local"}]}
+        previous = {"accounts": {
+            "command:Local": {"available": True, "notified": {}},
+        }}
+        payload = {
+            "available": True,
+            "availability_state": "rate_limited",
+            "weekly": {"used_percent": 96, "reset_at": 1786536000},
+            "error": "temporarily throttled",
+        }
+
+        with patch("token_limits.adapters.fetch_account", return_value=payload):
+            _result, events, state = process_accounts(config, previous, now=NOW)
+
+        self.assertIn("threshold", [event["kind"] for event in events])
+        self.assertTrue(state["accounts"]["command:Local"]["available"])
+
+    def test_failed_fetch_preserves_limited_state_for_later_recovery(self):
+        config = {"accounts": [{"provider": "command", "alias": "Local"}]}
+        previous = {"accounts": {
+            "command:Local": {"available": False, "notified": {}},
+        }}
+
+        with patch("token_limits.adapters.fetch_account", side_effect=RuntimeError("offline")):
+            _result, _events, state = process_accounts(config, previous, now=NOW)
+        with patch("token_limits.adapters.fetch_account", return_value={"available": True}):
+            _result, recovered_events, _state = process_accounts(config, state, now=NOW)
+
+        self.assertIn("available_again", [event["kind"] for event in recovered_events])
 
     def test_payload_reported_unavailability_still_allows_recovery_event(self):
         config = {"accounts": [{"provider": "command", "alias": "Local"}]}
@@ -302,6 +408,27 @@ class MultiAccountTests(unittest.TestCase):
         with patch("token_limits.adapters.fetch_account", return_value={"available": True}):
             _result, recovered_events, _state = process_accounts(config, state, now=NOW)
         self.assertIn("available_again", [event["kind"] for event in recovered_events])
+
+    def test_dns_fetch_failure_is_classified_as_error(self):
+        config = {"accounts": [{"provider": "anthropic", "alias": "Personal"}]}
+        dns_error = urllib.error.URLError(OSError(-3, "Temporary failure in name resolution"))
+
+        with patch("token_limits.adapters.fetch_account", side_effect=dns_error):
+            result, _events, _state = process_accounts(config, {}, now=NOW)
+
+        self.assertEqual(result["accounts"][0]["availability_state"], "error")
+
+    def test_rate_limit_fetch_failure_is_classified_as_rate_limited(self):
+        config = {"accounts": [{"provider": "anthropic", "alias": "Personal"}]}
+        rate_limit = urllib.error.HTTPError(
+            "https://example.test/usage", 429, "Too Many Requests",
+            Message(), None,
+        )
+
+        with patch("token_limits.adapters.fetch_account", side_effect=rate_limit):
+            result, _events, _state = process_accounts(config, {}, now=NOW)
+
+        self.assertEqual(result["accounts"][0]["availability_state"], "rate_limited")
 
     def test_fetch_error_includes_chained_retry_cause(self):
         config = {"accounts": [{"provider": "anthropic", "alias": "Personal"}]}

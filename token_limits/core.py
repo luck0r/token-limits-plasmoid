@@ -42,11 +42,20 @@ def normalize_account(provider: str, alias: str, raw: dict[str, Any], now: datet
     now = now or datetime.now(timezone.utc)
     windows = {name: win for name in ("session", "weekly") if (win := _window(raw.get(name), now)) is not None}
     derived_available = not any(win["used_percent"] >= 100 for win in windows.values())
+    available = bool(raw.get("available", derived_available))
+    derived_state = "available" if available else "limited"
+    requested_state = raw.get("availability_state")
+    if requested_state in ("error", "rate_limited"):
+        availability_state = requested_state
+        available = False
+    else:
+        availability_state = derived_state
     return {
         "id": f"{provider}:{alias}",
         "provider": provider,
         "alias": alias,
-        "available": bool(raw.get("available", derived_available)),
+        "available": available,
+        "availability_state": availability_state,
         "windows": windows,
         "error": raw.get("error"),
         "details": raw.get("details", {}),
@@ -112,23 +121,27 @@ def _process_accounts(config: dict[str, Any], previous_state: dict[str, Any], no
             raise ValueError(f"duplicate account id: {account_id}")
         seen.add(account_id)
         previous_account = previous_state.get("accounts", {}).get(account_id, {})
-        fetch_failed = False
         try:
             raw = fetch_account(entry)
         except Exception as exc:  # Collector must keep other accounts alive.
-            fetch_failed = True
             error_message = str(exc)
             if exc.__cause__ is not None:
                 error_message = f"{error_message} (caused by {exc.__cause__})"
             raw = {
                 "available": False,
+                "availability_state": (
+                    "rate_limited" if getattr(exc, "code", None) == 429 else "error"
+                ),
                 "error": error_message,
             }
         account = normalize_account(provider, alias, raw, now)
+        degraded = account["availability_state"] in {
+            "error", "rate_limited"
+        }
         result_accounts.append(account)
         thresholds = dict(defaults)
         thresholds.update(entry.get("thresholds", {}))
-        if fetch_failed:
+        if degraded and not account["windows"]:
             account_events = []
             account_state = dict(previous_account)
             account_state["notified"] = dict(previous_account.get("notified", {}))
@@ -136,6 +149,11 @@ def _process_accounts(config: dict[str, Any], previous_state: dict[str, Any], no
             account_events, account_state = evaluate_notifications(
                 account, previous_account, thresholds
             )
+            if degraded:
+                if "available" in previous_account:
+                    account_state["available"] = previous_account["available"]
+                else:
+                    account_state.pop("available", None)
         events.extend(account_events)
         next_state["accounts"][account_id] = account_state
 
